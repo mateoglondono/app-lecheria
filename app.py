@@ -2,8 +2,9 @@ import streamlit as st # Framework para crear la interfaz web de la aplicación
 import pandas as pd # Librería para manejar datos, cálculos y exportar a Excel
 from datetime import date, datetime, timedelta # Para manejar las fechas del calendario
 from io import BytesIO # Para generar el Excel en memoria
-from sqlalchemy import text # Para escribir consultas SQL con parámetros seguros
+from sqlalchemy import text, func, select # Consultas SQL con parámetros seguros y consultas ORM
 import hmac # Para comparar la contraseña de forma segura
+from modelos import Base, GastoSemanal, Registro # Modelos ORM de las tablas
 
 # Configuración de la página en el navegador
 st.set_page_config(page_title="Control Lechero Agro", page_icon="🐄", layout="wide")
@@ -27,10 +28,13 @@ def consultar(sql, **params):
 def es_admin():
     return st.session_state.get('es_admin', False)
 
-def ejecutar(sql, **params):
-    # Toda escritura pasa por aquí; si no es administrador se bloquea aunque la interfaz fallara
+def exigir_admin():
+    # Toda escritura llama a esto; si no es administrador se bloquea aunque la interfaz fallara
     if not es_admin():
         raise PermissionError("Solo el administrador puede modificar datos.")
+
+def ejecutar(sql, **params):
+    exigir_admin()
     with db().session as s:
         resultado = s.execute(text(sql), params)
         fila = resultado.first() if resultado.returns_rows else None
@@ -100,7 +104,115 @@ def respaldo_completo():
         'config': consultar("SELECT * FROM config ORDER BY id"),
         'periodos': consultar("SELECT * FROM periodos ORDER BY id"),
         'registros': consultar("SELECT * FROM registros ORDER BY id"),
+        'gastos_semanales': consultar("SELECT * FROM gastos_semanales ORDER BY id"),
     })
+
+
+# --- Control financiero y punto de equilibrio ---
+
+# Precio de referencia por bulto; en pantalla se puede editar para cada semana
+CUIDOS = {
+    "Levante (40kg)": 84071,
+    "Finalizador (40kg)": 82060,
+    "Gold Harina (40kg)": 75206,
+    "Gold Pastilla (40kg)": 76267,
+    "Terneras Nodrizas (40kg)": 89280,
+    "Cinta Azul (40kg)": 85036,
+    "Cuido de Perros (10kg)": 108267,
+    "Sal Mineralizada al 8%": 39242,
+    "Destete Preinicio": 167894,
+    "Otro": 0,
+}
+
+@st.cache_resource
+def preparar_tablas_financieras():
+    # Crea gastos_semanales si no existe (una sola vez por servidor) y la protege de la API pública de Supabase
+    engine = db().engine
+    Base.metadata.create_all(engine, tables=[GastoSemanal.__table__])
+    with engine.begin() as c:
+        c.execute(text("ALTER TABLE gastos_semanales ENABLE ROW LEVEL SECURITY"))
+
+def litros_producidos(fecha_inicio, fecha_fin, session):
+    # Suma de (mañana + tarde) de todos los ordeños entre las dos fechas, ambas incluidas
+    total = session.scalar(
+        select(func.coalesce(func.sum(Registro.litros_manana + Registro.litros_tarde), 0))
+        .where(Registro.fecha.between(fecha_inicio, fecha_fin))
+    )
+    return float(total)
+
+def calcular_liquidacion(litros_totales, precio_venta_litro, cantidad_bultos, precio_bulto, costos_fijos):
+    ingresos_leche = litros_totales * precio_venta_litro
+    costo_total_semana = (cantidad_bultos * precio_bulto) + costos_fijos
+    return {
+        'ingresos_leche': ingresos_leche,
+        'costo_total_semana': costo_total_semana,
+        # Costo de producir 1 litro (sin litros no se puede calcular)
+        'punto_equilibrio_litro': costo_total_semana / litros_totales if litros_totales else 0.0,
+        'utilidad_neta_semana': ingresos_leche - costo_total_semana,
+    }
+
+def existe_liquidacion(fecha_inicio, fecha_fin):
+    with db().session as s:
+        return s.scalar(select(GastoSemanal.id).where(GastoSemanal.fecha_inicio == fecha_inicio,
+                                                      GastoSemanal.fecha_fin == fecha_fin)) is not None
+
+def guardar_liquidacion(datos):
+    # Si ya hay una liquidación con las mismas fechas se reemplaza, para no contar dos veces la misma semana
+    exigir_admin()
+    with db().session as s:
+        existente = s.scalar(select(GastoSemanal).where(GastoSemanal.fecha_inicio == datos['fecha_inicio'],
+                                                        GastoSemanal.fecha_fin == datos['fecha_fin']))
+        if existente:
+            for campo, valor in datos.items():
+                setattr(existente, campo, valor)
+        else:
+            s.add(GastoSemanal(**datos))
+        s.commit()
+    return existente is not None
+
+def listar_liquidaciones():
+    df = consultar("SELECT * FROM gastos_semanales ORDER BY fecha_inicio, id")
+    for col in ('fecha_inicio', 'fecha_fin'):
+        df[col] = pd.to_datetime(df[col]).dt.date
+    return df
+
+def excel_financiero(df):
+    # Reporte consolidado con formato de moneda y una fila de totales al final
+    columnas = {
+        'fecha_inicio': ('Fecha inicio', 'fecha'), 'fecha_fin': ('Fecha fin', 'fecha'),
+        'litros_totales': ('Litros totales', 'litros'), 'precio_venta_litro': ('Precio venta litro', 'pesos'),
+        'ingresos_leche': ('Ingresos leche', 'pesos'), 'tipo_cuido': ('Tipo de cuido', None),
+        'cantidad_bultos': ('Cantidad bultos', 'litros'), 'precio_bulto': ('Precio bulto', 'pesos'),
+        'costos_fijos': ('Costos fijos', 'pesos'), 'costo_total_semana': ('Costo total semana', 'pesos'),
+        'punto_equilibrio_litro': ('Punto equilibrio litro', 'pesos'),
+        'utilidad_neta_semana': ('Utilidad neta semana', 'pesos'),
+    }
+    reporte = df[list(columnas)].rename(columns={k: v[0] for k, v in columnas.items()})
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter', date_format='dd/mm/yyyy') as writer:
+        reporte.to_excel(writer, index=False, sheet_name='Reporte Financiero')
+        libro, hoja = writer.book, writer.sheets['Reporte Financiero']
+        formatos = {'pesos': libro.add_format({'num_format': '$#,##0'}),
+                    'litros': libro.add_format({'num_format': '#,##0.0'}),
+                    'fecha': libro.add_format({'num_format': 'dd/mm/yyyy'}), None: None}
+        negrita = {k: libro.add_format({'bold': True, 'top': 1, **({'num_format': f.num_format} if f else {})})
+                   for k, f in formatos.items()}
+        for i, (_, (titulo, tipo)) in enumerate(columnas.items()):
+            hoja.set_column(i, i, max(len(titulo) + 2, 14), formatos[tipo])
+
+        # Fila de totales (solo columnas que tiene sentido sumar)
+        fila = len(reporte) + 1
+        hoja.write(fila, 0, 'TOTAL', negrita[None])
+        for i, col in enumerate(columnas):
+            if col in ('litros_totales', 'ingresos_leche', 'cantidad_bultos', 'costos_fijos',
+                       'costo_total_semana', 'utilidad_neta_semana'):
+                letra = chr(ord('A') + i)
+                # Se guarda también el resultado para que visores sin recálculo (celular, vista previa) no muestren 0
+                hoja.write_formula(fila, i, f"=SUM({letra}2:{letra}{fila})", negrita[columnas[col][1]],
+                                   float(reporte.iloc[:, i].sum()))
+        hoja.freeze_panes(1, 0)
+    return output.getvalue()
 
 
 # =====================================================================
@@ -306,6 +418,136 @@ def seccion_configuracion():
 
 
 # =====================================================================
+# SECCIÓN D: 📈 CONTROL FINANCIERO Y PUNTO DE EQUILIBRIO
+# (administrador registra; socios consultan y exportan)
+# =====================================================================
+
+def seccion_financiera():
+    st.title("📈 Control Financiero")
+    st.caption("Ingresos, costos, punto de equilibrio y utilidad de cada semana.")
+
+    if es_admin():
+        # Por defecto se proponen las fechas del último periodo creado
+        periodos = listar_periodos()
+        if periodos.empty:
+            defecto_inicio, defecto_fin = date.today() - timedelta(days=6), date.today()
+        else:
+            defecto_inicio = pd.to_datetime(periodos.iloc[0]['fecha_inicio']).date()
+            defecto_fin = pd.to_datetime(periodos.iloc[0]['fecha_fin']).date()
+
+        # --- 1. Producción del rango ---
+        with st.container(border=True):
+            st.subheader("🥛 1. Producción de la semana")
+            col1, col2, col3 = st.columns([2, 2, 2], vertical_alignment="bottom")
+            fecha_inicio = col1.date_input("Fecha inicio", defecto_inicio, format="DD/MM/YYYY", key="fin_inicio")
+            fecha_fin = col2.date_input("Fecha fin", defecto_fin, format="DD/MM/YYYY", key="fin_fin")
+            if fecha_fin < fecha_inicio:
+                st.error("La fecha fin no puede ser anterior a la fecha inicio.")
+                return
+            # Se consulta a la base cada vez que cambian las fechas
+            with db().session as s:
+                litros_totales = litros_producidos(fecha_inicio, fecha_fin, s)
+            col3.metric("Total litros producidos", litros(litros_totales), border=True)
+            if litros_totales == 0:
+                st.warning("No hay ordeños registrados entre esas fechas.")
+
+        # --- 2. Ingresos y costos ---
+        with st.container(border=True):
+            st.subheader("💵 2. Ingresos y costos")
+            c1, c2 = st.columns(2)
+            precio_venta = c1.number_input("Precio de venta por litro ($)", min_value=0.0, step=10.0,
+                                           value=obtener_precio())
+            costos_fijos = c2.number_input("Otros costos fijos de la semana ($)", min_value=0.0, step=1000.0,
+                                           help="Mano de obra, transporte, medicamentos, servicios, etc.")
+
+            c3, c4, c5 = st.columns(3)
+            insumo = c3.selectbox("Insumo (cuido)", list(CUIDOS.keys()))
+            tipo_cuido = insumo
+            if insumo == 'Otro':
+                tipo_cuido = c3.text_input("Nombre del insumo", placeholder="Ej. Sal mineralizada").strip()
+            # La key cambia con el insumo: al elegir otro se vuelve a llenar su precio, pero se puede editar
+            precio_bulto = c4.number_input("Precio por bulto ($)", min_value=0.0, step=1000.0,
+                                           value=float(CUIDOS[insumo]), key=f"precio_bulto_{insumo}")
+            cantidad_bultos = c5.number_input("Cantidad de bultos", min_value=0.0, step=1.0)
+
+        # --- 3. Resultado ---
+        calculo = calcular_liquidacion(litros_totales, precio_venta, cantidad_bultos, precio_bulto, costos_fijos)
+        with st.container(border=True):
+            st.subheader("🧮 3. Resultado de la semana")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Total ingresos leche", pesos(calculo['ingresos_leche']), border=True)
+            r2.metric("Total costos semana", pesos(calculo['costo_total_semana']), border=True)
+            # El signo va al inicio del texto para que Streamlit pinte la flecha verde (+) o roja (-)
+            margen = precio_venta - calculo['punto_equilibrio_litro']
+            delta_margen = f"{'-' if margen < 0 else '+'}{pesos(abs(margen))} de margen por litro" if litros_totales else None
+            utilidad = calculo['utilidad_neta_semana']
+            r3.metric("Total punto de equilibrio por litro", pesos(calculo['punto_equilibrio_litro']),
+                      delta=delta_margen, border=True)
+            r4.metric("Total utilidad neta", pesos(utilidad),
+                      delta=("Ganancia" if utilidad >= 0 else "Pérdida") if litros_totales else None,
+                      delta_color="green" if utilidad >= 0 else "red",
+                      delta_arrow="up" if utilidad >= 0 else "down", border=True)
+            st.caption("Punto de equilibrio = lo que cuesta producir 1 litro. "
+                       "Si es menor que el precio de venta, la semana deja ganancia.")
+
+            if existe_liquidacion(fecha_inicio, fecha_fin):
+                st.info("Ya hay una liquidación guardada con estas mismas fechas. Si guardas, se reemplazará.")
+            puede_guardar = litros_totales > 0 and bool(tipo_cuido)
+            if st.button("💾 Guardar Liquidación Semanal", type="primary", width="stretch",
+                         disabled=not puede_guardar):
+                reemplazada = guardar_liquidacion({
+                    'fecha_inicio': fecha_inicio, 'fecha_fin': fecha_fin,
+                    'litros_totales': litros_totales, 'precio_venta_litro': precio_venta,
+                    'tipo_cuido': tipo_cuido, 'cantidad_bultos': cantidad_bultos,
+                    'precio_bulto': precio_bulto, 'costos_fijos': costos_fijos, **calculo,
+                })
+                st.success("Liquidación actualizada." if reemplazada else "Liquidación guardada.")
+
+        st.divider()
+
+    # --- Histórico financiero (todos los roles) ---
+    df = listar_liquidaciones()
+    with st.container(border=True):
+        st.subheader("📚 Liquidaciones guardadas")
+        if df.empty:
+            st.info("Todavía no hay liquidaciones guardadas.")
+            return
+
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Total ingresos acumulados", pesos(df['ingresos_leche'].sum()), border=True)
+        t2.metric("Total costos acumulados", pesos(df['costo_total_semana'].sum()), border=True)
+        t3.metric("Total utilidad neta acumulada", pesos(df['utilidad_neta_semana'].sum()), border=True)
+
+        moneda = lambda titulo: st.column_config.NumberColumn(titulo, format="localized")
+        st.dataframe(
+            df[['fecha_inicio', 'fecha_fin', 'litros_totales', 'precio_venta_litro', 'ingresos_leche', 'tipo_cuido',
+                'cantidad_bultos', 'precio_bulto', 'costos_fijos', 'costo_total_semana',
+                'punto_equilibrio_litro', 'utilidad_neta_semana']],
+            hide_index=True, width="stretch",
+            column_config={
+                'fecha_inicio': st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
+                'fecha_fin': st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
+                'litros_totales': st.column_config.NumberColumn("Litros", format="%.1f"),
+                'precio_venta_litro': moneda("Precio venta ($/L)"),
+                'ingresos_leche': moneda("Ingresos ($)"),
+                'tipo_cuido': "Cuido",
+                'cantidad_bultos': st.column_config.NumberColumn("Bultos", format="%.1f"),
+                'precio_bulto': moneda("Precio bulto ($)"),
+                'costos_fijos': moneda("Costos fijos ($)"),
+                'costo_total_semana': moneda("Costo total ($)"),
+                'punto_equilibrio_litro': moneda("Equilibrio ($/L)"),
+                'utilidad_neta_semana': moneda("Utilidad neta ($)"),
+            },
+        )
+
+        st.download_button("📥 Descargar Reporte Financiero (Excel)",
+                           data=excel_financiero(df),
+                           file_name=f"Reporte_Financiero_{date.today().strftime('%Y-%m-%d')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary", width="stretch")
+
+
+# =====================================================================
 # ROLES Y MENÚ DE NAVEGACIÓN
 # =====================================================================
 
@@ -331,15 +573,20 @@ with st.sidebar:
         SECCIONES = {
             "📝 Registro Operativo": seccion_registro,
             "💰 Facturación y Análisis": seccion_facturacion,
+            "📈 Control Financiero": seccion_financiera,
             "⚙️ Configuración y Respaldo": seccion_configuracion,
         }
     else:
-        # Los socios solo ven la facturación y pueden exportar el Excel
-        SECCIONES = {"💰 Facturación y Análisis": seccion_facturacion}
+        # Los socios solo consultan y exportan: facturación y liquidaciones financieras
+        SECCIONES = {
+            "💰 Facturación y Análisis": seccion_facturacion,
+            "📈 Control Financiero": seccion_financiera,
+        }
     seccion = st.radio("Menú", list(SECCIONES.keys()), label_visibility="collapsed")
 
     st.divider()
     try:
+        preparar_tablas_financieras()
         st.caption(f"Precio vigente: {pesos(obtener_precio())}/L")
     except Exception as e:
         st.error(f"No se pudo conectar a la base de datos ({type(e).__name__}). Revisa la URI en los secrets.")
