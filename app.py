@@ -132,17 +132,63 @@ def preparar_tablas_financieras():
     with engine.begin() as c:
         c.execute(text("ALTER TABLE gastos_semanales ENABLE ROW LEVEL SECURITY"))
 
-def litros_producidos(fecha_inicio, fecha_fin, session):
-    # Suma de (mañana + tarde) de todos los ordeños entre las dos fechas, ambas incluidas
+def litros_producidos(periodo_id, session):
+    # Suma de (mañana + tarde) de todos los ordeños del periodo
     total = session.scalar(
         select(func.coalesce(func.sum(Registro.litros_manana + Registro.litros_tarde), 0))
-        .where(Registro.fecha.between(fecha_inicio, fecha_fin))
+        .where(Registro.periodo_id == periodo_id)
     )
     return float(total)
 
-def calcular_liquidacion(litros_totales, precio_venta_litro, cantidad_bultos, precio_bulto, costos_fijos):
+# Tabla editable de cuidos comprados en la semana
+COLUMNAS_CUIDOS = ['Insumo', 'Detalle', 'Bultos', 'Precio bulto', 'Subtotal']
+
+def tabla_cuidos(detalle=None):
+    # Convierte la lista guardada en la BD (detalle_cuidos) en la tabla que se edita en pantalla
+    filas = [{'Insumo': c['insumo'], 'Detalle': c.get('detalle', ''), 'Bultos': float(c['cantidad_bultos']),
+              'Precio bulto': float(c['precio_bulto']), 'Subtotal': float(c['subtotal'])} for c in detalle or []]
+    df = pd.DataFrame(filas, columns=COLUMNAS_CUIDOS)
+    return df.astype({'Insumo': 'object', 'Detalle': 'object', 'Bultos': 'float', 'Precio bulto': 'float',
+                      'Subtotal': 'float'})
+
+def completar_cuidos(editada, anterior):
+    # Autocompleta el precio cuando el insumo es nuevo o cambió (si no, respeta el precio editado)
+    # y recalcula el subtotal de cada fila
+    filas = []
+    for idx, fila in editada.iterrows():
+        insumo = fila['Insumo'] if isinstance(fila['Insumo'], str) and fila['Insumo'] in CUIDOS else None
+        bultos = 0.0 if pd.isna(fila['Bultos']) else float(fila['Bultos'])
+        precio = None if pd.isna(fila['Precio bulto']) else float(fila['Precio bulto'])
+        insumo_cambio = idx not in anterior.index or anterior.at[idx, 'Insumo'] != insumo
+        # 'Otro' vale $0 en el diccionario: nunca borra un precio que el usuario ya escribió
+        if insumo and (precio is None or (insumo_cambio and CUIDOS[insumo] > 0)):
+            precio = float(CUIDOS[insumo])
+        filas.append({'Insumo': insumo, 'Detalle': fila['Detalle'] if isinstance(fila['Detalle'], str) else '',
+                      'Bultos': bultos, 'Precio bulto': precio,
+                      'Subtotal': bultos * precio if precio is not None else 0.0})
+    df = pd.DataFrame(filas, columns=COLUMNAS_CUIDOS)
+    return df.astype({'Insumo': 'object', 'Detalle': 'object', 'Bultos': 'float', 'Precio bulto': 'float',
+                      'Subtotal': 'float'})
+
+def firma_cuidos(df):
+    # Valores de la tabla sin NaN, para saber si el autocompletado cambió algo
+    return [tuple(None if (isinstance(v, float) and pd.isna(v)) else v for v in fila)
+            for fila in df[COLUMNAS_CUIDOS].itertuples(index=False)]
+
+def detalle_desde_tabla(df):
+    # Solo se guardan las filas con insumo y bultos
+    return [{'insumo': f['Insumo'], 'detalle': f['Detalle'], 'cantidad_bultos': f['Bultos'],
+             'precio_bulto': f['Precio bulto'], 'subtotal': f['Subtotal']}
+            for _, f in df.iterrows() if f['Insumo'] and f['Bultos'] > 0]
+
+def resumen_cuidos(detalle):
+    # Ej.: "2 × Levante (40kg); 1 × Sal Mineralizada al 8%"
+    return "; ".join(f"{c['cantidad_bultos']:g} × {c['insumo']}" + (f" ({c['detalle']})" if c.get('detalle') else "")
+                     for c in detalle or [])
+
+def calcular_liquidacion(litros_totales, precio_venta_litro, costo_cuidos, costos_fijos):
     ingresos_leche = litros_totales * precio_venta_litro
-    costo_total_semana = (cantidad_bultos * precio_bulto) + costos_fijos
+    costo_total_semana = costo_cuidos + costos_fijos
     return {
         'ingresos_leche': ingresos_leche,
         'costo_total_semana': costo_total_semana,
@@ -151,17 +197,15 @@ def calcular_liquidacion(litros_totales, precio_venta_litro, cantidad_bultos, pr
         'utilidad_neta_semana': ingresos_leche - costo_total_semana,
     }
 
-def existe_liquidacion(fecha_inicio, fecha_fin):
-    with db().session as s:
-        return s.scalar(select(GastoSemanal.id).where(GastoSemanal.fecha_inicio == fecha_inicio,
-                                                      GastoSemanal.fecha_fin == fecha_fin)) is not None
+def obtener_liquidacion(periodo_id):
+    df = consultar("SELECT * FROM gastos_semanales WHERE periodo_id = :pid", pid=periodo_id)
+    return None if df.empty else df.iloc[0].to_dict()
 
 def guardar_liquidacion(datos):
-    # Si ya hay una liquidación con las mismas fechas se reemplaza, para no contar dos veces la misma semana
+    # Una liquidación por periodo: si ya existe se reemplaza, para no contar dos veces la misma semana
     exigir_admin()
     with db().session as s:
-        existente = s.scalar(select(GastoSemanal).where(GastoSemanal.fecha_inicio == datos['fecha_inicio'],
-                                                        GastoSemanal.fecha_fin == datos['fecha_fin']))
+        existente = s.scalar(select(GastoSemanal).where(GastoSemanal.periodo_id == datos['periodo_id']))
         if existente:
             for campo, valor in datos.items():
                 setattr(existente, campo, valor)
@@ -171,47 +215,66 @@ def guardar_liquidacion(datos):
     return existente is not None
 
 def listar_liquidaciones():
-    df = consultar("SELECT * FROM gastos_semanales ORDER BY fecha_inicio, id")
+    # Liquidaciones con las fechas de su periodo, para mostrarlas y exportarlas
+    df = consultar('''SELECT g.*, p.fecha_inicio, p.fecha_fin
+                      FROM gastos_semanales g JOIN periodos p ON p.id = g.periodo_id
+                      ORDER BY p.fecha_inicio, g.periodo_id''')
     for col in ('fecha_inicio', 'fecha_fin'):
         df[col] = pd.to_datetime(df[col]).dt.date
+    df['resumen_cuidos'] = df['detalle_cuidos'].apply(resumen_cuidos)
     return df
 
-def excel_financiero(df):
-    # Reporte consolidado con formato de moneda y una fila de totales al final
-    columnas = {
-        'fecha_inicio': ('Fecha inicio', 'fecha'), 'fecha_fin': ('Fecha fin', 'fecha'),
-        'litros_totales': ('Litros totales', 'litros'), 'precio_venta_litro': ('Precio venta litro', 'pesos'),
-        'ingresos_leche': ('Ingresos leche', 'pesos'), 'tipo_cuido': ('Tipo de cuido', None),
-        'cantidad_bultos': ('Cantidad bultos', 'litros'), 'precio_bulto': ('Precio bulto', 'pesos'),
-        'costos_fijos': ('Costos fijos', 'pesos'), 'costo_total_semana': ('Costo total semana', 'pesos'),
-        'punto_equilibrio_litro': ('Punto equilibrio litro', 'pesos'),
-        'utilidad_neta_semana': ('Utilidad neta semana', 'pesos'),
-    }
+def escribir_hoja(writer, df, nombre, columnas, sumables):
+    # columnas: {columna_df: (título, formato)}; sumables: columnas que llevan total al final
     reporte = df[list(columnas)].rename(columns={k: v[0] for k, v in columnas.items()})
+    reporte.to_excel(writer, index=False, sheet_name=nombre)
+    libro, hoja = writer.book, writer.sheets[nombre]
+    formatos = {'pesos': libro.add_format({'num_format': '$#,##0'}),
+                'litros': libro.add_format({'num_format': '#,##0.0'}),
+                'fecha': libro.add_format({'num_format': 'dd/mm/yyyy'}), None: None}
+    negrita = {k: libro.add_format({'bold': True, 'top': 1, **({'num_format': f.num_format} if f else {})})
+               for k, f in formatos.items()}
+    for i, (_, (titulo, tipo)) in enumerate(columnas.items()):
+        hoja.set_column(i, i, max(len(titulo) + 2, 14), formatos[tipo])
+
+    # Fila de totales (solo columnas que tiene sentido sumar)
+    fila = len(reporte) + 1
+    hoja.write(fila, 0, 'TOTAL', negrita[None])
+    for i, col in enumerate(columnas):
+        if col in sumables:
+            letra = chr(ord('A') + i)
+            # Se guarda también el resultado para que visores sin recálculo (celular, vista previa) no muestren 0
+            hoja.write_formula(fila, i, f"=SUM({letra}2:{letra}{fila})", negrita[columnas[col][1]],
+                               float(reporte.iloc[:, i].sum()))
+    hoja.freeze_panes(1, 0)
+
+def excel_financiero(df):
+    # Hoja 1: una fila por semana. Hoja 2: cada cuido comprado, por semana.
+    detalle = pd.DataFrame(
+        [{'periodo_id': f['periodo_id'], 'fecha_inicio': f['fecha_inicio'], 'fecha_fin': f['fecha_fin'], **c}
+         for _, f in df.iterrows() for c in f['detalle_cuidos']],
+        columns=['periodo_id', 'fecha_inicio', 'fecha_fin', 'insumo', 'detalle', 'cantidad_bultos',
+                 'precio_bulto', 'subtotal'])
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter', date_format='dd/mm/yyyy') as writer:
-        reporte.to_excel(writer, index=False, sheet_name='Reporte Financiero')
-        libro, hoja = writer.book, writer.sheets['Reporte Financiero']
-        formatos = {'pesos': libro.add_format({'num_format': '$#,##0'}),
-                    'litros': libro.add_format({'num_format': '#,##0.0'}),
-                    'fecha': libro.add_format({'num_format': 'dd/mm/yyyy'}), None: None}
-        negrita = {k: libro.add_format({'bold': True, 'top': 1, **({'num_format': f.num_format} if f else {})})
-                   for k, f in formatos.items()}
-        for i, (_, (titulo, tipo)) in enumerate(columnas.items()):
-            hoja.set_column(i, i, max(len(titulo) + 2, 14), formatos[tipo])
-
-        # Fila de totales (solo columnas que tiene sentido sumar)
-        fila = len(reporte) + 1
-        hoja.write(fila, 0, 'TOTAL', negrita[None])
-        for i, col in enumerate(columnas):
-            if col in ('litros_totales', 'ingresos_leche', 'cantidad_bultos', 'costos_fijos',
-                       'costo_total_semana', 'utilidad_neta_semana'):
-                letra = chr(ord('A') + i)
-                # Se guarda también el resultado para que visores sin recálculo (celular, vista previa) no muestren 0
-                hoja.write_formula(fila, i, f"=SUM({letra}2:{letra}{fila})", negrita[columnas[col][1]],
-                                   float(reporte.iloc[:, i].sum()))
-        hoja.freeze_panes(1, 0)
+        escribir_hoja(writer, df, 'Reporte Financiero', {
+            'periodo_id': ('Semana #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
+            'fecha_fin': ('Fecha fin', 'fecha'), 'litros_totales': ('Litros totales', 'litros'),
+            'precio_venta_litro': ('Precio venta litro', 'pesos'), 'ingresos_leche': ('Ingresos leche', 'pesos'),
+            'costo_cuidos': ('Costo cuidos', 'pesos'), 'costos_fijos': ('Costos fijos', 'pesos'),
+            'costo_total_semana': ('Costo total semana', 'pesos'),
+            'punto_equilibrio_litro': ('Punto equilibrio litro', 'pesos'),
+            'utilidad_neta_semana': ('Utilidad neta semana', 'pesos'),
+            'resumen_cuidos': ('Detalle cuidos', None),
+        }, sumables={'litros_totales', 'ingresos_leche', 'costo_cuidos', 'costos_fijos',
+                     'costo_total_semana', 'utilidad_neta_semana'})
+        escribir_hoja(writer, detalle, 'Detalle Cuidos', {
+            'periodo_id': ('Semana #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
+            'fecha_fin': ('Fecha fin', 'fecha'), 'insumo': ('Insumo', None), 'detalle': ('Detalle', None),
+            'cantidad_bultos': ('Bultos', 'litros'), 'precio_bulto': ('Precio bulto', 'pesos'),
+            'subtotal': ('Subtotal', 'pesos'),
+        }, sumables={'cantidad_bultos', 'subtotal'})
     return output.getvalue()
 
 
@@ -427,53 +490,87 @@ def seccion_financiera():
     st.caption("Ingresos, costos, punto de equilibrio y utilidad de cada semana.")
 
     if es_admin():
-        # Por defecto se proponen las fechas del último periodo creado
         periodos = listar_periodos()
         if periodos.empty:
-            defecto_inicio, defecto_fin = date.today() - timedelta(days=6), date.today()
-        else:
-            defecto_inicio = pd.to_datetime(periodos.iloc[0]['fecha_inicio']).date()
-            defecto_fin = pd.to_datetime(periodos.iloc[0]['fecha_fin']).date()
+            st.info("No hay periodos creados todavía. Ve a 📝 Registro Operativo para crear el primero.")
+            return
 
-        # --- 1. Producción del rango ---
+        # --- 1. Semana y producción ---
         with st.container(border=True):
-            st.subheader("🥛 1. Producción de la semana")
-            col1, col2, col3 = st.columns([2, 2, 2], vertical_alignment="bottom")
-            fecha_inicio = col1.date_input("Fecha inicio", defecto_inicio, format="DD/MM/YYYY", key="fin_inicio")
-            fecha_fin = col2.date_input("Fecha fin", defecto_fin, format="DD/MM/YYYY", key="fin_fin")
-            if fecha_fin < fecha_inicio:
-                st.error("La fecha fin no puede ser anterior a la fecha inicio.")
-                return
-            # Se consulta a la base cada vez que cambian las fechas
+            st.subheader("🥛 1. Semana a liquidar")
+            col1, col2 = st.columns([3, 1.3], vertical_alignment="bottom")
+            # Las opciones son los IDs reales de la tabla 'periodos'; la etiqueta solo es lo que se ve
+            etiquetas = {int(fila['id']): etiqueta_periodo(fila) for _, fila in periodos.iterrows()}
+            periodo_id = col1.selectbox("Semana (periodo)", options=list(etiquetas.keys()),
+                                        format_func=lambda pid: etiquetas[pid], key="fin_periodo")
+            precio_periodo = float(periodos.loc[periodos['id'] == periodo_id, 'precio_aplicado'].iloc[0])
+            # Se consulta a la base cada vez que cambia la semana
             with db().session as s:
-                litros_totales = litros_producidos(fecha_inicio, fecha_fin, s)
-            col3.metric("Total litros producidos", litros(litros_totales), border=True)
+                litros_totales = litros_producidos(periodo_id, s)
+            col2.metric("Total litros producidos", litros(litros_totales), border=True)
             if litros_totales == 0:
-                st.warning("No hay ordeños registrados entre esas fechas.")
+                st.warning("Esta semana todavía no tiene ordeños registrados.")
+
+        # Si la semana ya tiene liquidación, se cargan sus valores para corregirlos
+        guardada = obtener_liquidacion(periodo_id)
 
         # --- 2. Ingresos y costos ---
         with st.container(border=True):
-            st.subheader("💵 2. Ingresos y costos")
+            st.subheader("💵 2. Ingresos y costos fijos")
             c1, c2 = st.columns(2)
             precio_venta = c1.number_input("Precio de venta por litro ($)", min_value=0.0, step=10.0,
-                                           value=obtener_precio())
+                                           value=float(guardada['precio_venta_litro']) if guardada else precio_periodo,
+                                           key=f"fin_precio_{periodo_id}")
             costos_fijos = c2.number_input("Otros costos fijos de la semana ($)", min_value=0.0, step=1000.0,
+                                           value=float(guardada['costos_fijos']) if guardada else 0.0,
+                                           key=f"fin_fijos_{periodo_id}",
                                            help="Mano de obra, transporte, medicamentos, servicios, etc.")
 
-            c3, c4, c5 = st.columns(3)
-            insumo = c3.selectbox("Insumo (cuido)", list(CUIDOS.keys()))
-            tipo_cuido = insumo
-            if insumo == 'Otro':
-                tipo_cuido = c3.text_input("Nombre del insumo", placeholder="Ej. Sal mineralizada").strip()
-            # La key cambia con el insumo: al elegir otro se vuelve a llenar su precio, pero se puede editar
-            precio_bulto = c4.number_input("Precio por bulto ($)", min_value=0.0, step=1000.0,
-                                           value=float(CUIDOS[insumo]), key=f"precio_bulto_{insumo}")
-            cantidad_bultos = c5.number_input("Cantidad de bultos", min_value=0.0, step=1.0)
-
-        # --- 3. Resultado ---
-        calculo = calcular_liquidacion(litros_totales, precio_venta, cantidad_bultos, precio_bulto, costos_fijos)
+        # --- 3. Cuidos comprados (varias filas) ---
         with st.container(border=True):
-            st.subheader("🧮 3. Resultado de la semana")
+            st.subheader("🌾 3. Cuidos comprados en la semana")
+            st.caption("Agrega una fila por cada insumo. El precio se llena solo al elegir el insumo, "
+                       "pero puedes cambiarlo. Para borrar una fila, selecciónala y usa el ícono de papelera.")
+
+            # La tabla vive en session_state por semana; 'version' renueva el editor tras autocompletar
+            clave = f"cuidos_{periodo_id}"
+            if clave not in st.session_state:
+                st.session_state[clave] = tabla_cuidos(guardada['detalle_cuidos'] if guardada else None)
+                st.session_state[clave + "_version"] = 0
+            anterior = st.session_state[clave]
+
+            editada = st.data_editor(
+                anterior, num_rows="dynamic", hide_index=True, width="stretch",
+                key=f"{clave}_editor_{st.session_state[clave + '_version']}",
+                column_config={
+                    'Insumo': st.column_config.SelectboxColumn("Insumo", options=list(CUIDOS.keys()),
+                                                               required=True, width="large"),
+                    'Detalle': st.column_config.TextColumn("Detalle (opcional)",
+                                                           help="Ej. el nombre del producto si eliges 'Otro'"),
+                    'Bultos': st.column_config.NumberColumn("Bultos", min_value=0.0, step=1.0, format="%.1f"),
+                    'Precio bulto': st.column_config.NumberColumn("Precio bulto ($)", min_value=0.0, step=100.0,
+                                                                  format="localized"),
+                    'Subtotal': st.column_config.NumberColumn("Subtotal ($)", disabled=True, format="localized"),
+                },
+            )
+            completada = completar_cuidos(editada, anterior)
+            if firma_cuidos(completada) != firma_cuidos(editada):
+                # Hubo autocompletado: se guarda y se vuelve a dibujar la tabla con el precio y el subtotal
+                st.session_state[clave] = completada
+                st.session_state[clave + "_version"] += 1
+                st.rerun()
+            st.session_state[clave] = completada
+
+            detalle_cuidos = detalle_desde_tabla(completada)
+            costo_cuidos = sum(c['subtotal'] for c in detalle_cuidos)
+            if any(c['precio_bulto'] == 0 for c in detalle_cuidos):
+                st.warning("Hay insumos con precio $0 (por ejemplo 'Otro'). Escribe su precio por bulto.")
+            st.metric("Total costo cuidos", pesos(costo_cuidos))
+
+        # --- 4. Resultado ---
+        calculo = calcular_liquidacion(litros_totales, precio_venta, costo_cuidos, costos_fijos)
+        with st.container(border=True):
+            st.subheader("🧮 4. Resultado de la semana")
             r1, r2, r3, r4 = st.columns(4)
             r1.metric("Total ingresos leche", pesos(calculo['ingresos_leche']), border=True)
             r2.metric("Total costos semana", pesos(calculo['costo_total_semana']), border=True)
@@ -490,16 +587,14 @@ def seccion_financiera():
             st.caption("Punto de equilibrio = lo que cuesta producir 1 litro. "
                        "Si es menor que el precio de venta, la semana deja ganancia.")
 
-            if existe_liquidacion(fecha_inicio, fecha_fin):
-                st.info("Ya hay una liquidación guardada con estas mismas fechas. Si guardas, se reemplazará.")
-            puede_guardar = litros_totales > 0 and bool(tipo_cuido)
+            if guardada:
+                st.info("Esta semana ya tiene una liquidación guardada (se cargó arriba). Si guardas, se reemplazará.")
             if st.button("💾 Guardar Liquidación Semanal", type="primary", width="stretch",
-                         disabled=not puede_guardar):
+                         disabled=litros_totales == 0):
                 reemplazada = guardar_liquidacion({
-                    'fecha_inicio': fecha_inicio, 'fecha_fin': fecha_fin,
-                    'litros_totales': litros_totales, 'precio_venta_litro': precio_venta,
-                    'tipo_cuido': tipo_cuido, 'cantidad_bultos': cantidad_bultos,
-                    'precio_bulto': precio_bulto, 'costos_fijos': costos_fijos, **calculo,
+                    'periodo_id': periodo_id, 'litros_totales': litros_totales,
+                    'precio_venta_litro': precio_venta, 'costo_cuidos': costo_cuidos,
+                    'detalle_cuidos': detalle_cuidos, 'costos_fijos': costos_fijos, **calculo,
                 })
                 st.success("Liquidación actualizada." if reemplazada else "Liquidación guardada.")
 
@@ -520,19 +615,19 @@ def seccion_financiera():
 
         moneda = lambda titulo: st.column_config.NumberColumn(titulo, format="localized")
         st.dataframe(
-            df[['fecha_inicio', 'fecha_fin', 'litros_totales', 'precio_venta_litro', 'ingresos_leche', 'tipo_cuido',
-                'cantidad_bultos', 'precio_bulto', 'costos_fijos', 'costo_total_semana',
+            df[['periodo_id', 'fecha_inicio', 'fecha_fin', 'litros_totales', 'precio_venta_litro', 'ingresos_leche',
+                'costo_cuidos', 'resumen_cuidos', 'costos_fijos', 'costo_total_semana',
                 'punto_equilibrio_litro', 'utilidad_neta_semana']],
             hide_index=True, width="stretch",
             column_config={
+                'periodo_id': st.column_config.NumberColumn("Semana #", format="%d"),
                 'fecha_inicio': st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
                 'fecha_fin': st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
                 'litros_totales': st.column_config.NumberColumn("Litros", format="%.1f"),
                 'precio_venta_litro': moneda("Precio venta ($/L)"),
                 'ingresos_leche': moneda("Ingresos ($)"),
-                'tipo_cuido': "Cuido",
-                'cantidad_bultos': st.column_config.NumberColumn("Bultos", format="%.1f"),
-                'precio_bulto': moneda("Precio bulto ($)"),
+                'costo_cuidos': moneda("Costo cuidos ($)"),
+                'resumen_cuidos': st.column_config.TextColumn("Cuidos comprados", width="large"),
                 'costos_fijos': moneda("Costos fijos ($)"),
                 'costo_total_semana': moneda("Costo total ($)"),
                 'punto_equilibrio_litro': moneda("Equilibrio ($/L)"),
