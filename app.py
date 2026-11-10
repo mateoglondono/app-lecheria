@@ -10,7 +10,7 @@ from modelos import Base, GastoSemanal, Registro # Modelos ORM de las tablas
 st.set_page_config(page_title="Control Lechero Agro", page_icon="🐄", layout="wide")
 
 ROL_SOCIO = "Socio (Solo Lectura)"
-ROL_TRABAJADOR = "Trabajador de la finca"
+ROL_TRABAJADOR = "Santiago"
 ROL_ADMIN = "Administrador (Tú)"
 
 # Clave de cada rol dentro de [auth] en los secrets
@@ -824,14 +824,14 @@ with st.sidebar:
     elif not secreto:
         st.error("Este rol no tiene contraseña configurada en los secrets.")
     elif rol_elegido == ROL_TRABAJADOR and secreto in (claves[ROL_ADMIN], claves[ROL_SOCIO]):
-        st.error("El PIN del trabajador debe ser distinto al del administrador y al de los socios.")
+        st.error("El PIN de Santiago debe ser distinto al del administrador y al de los socios.")
     else:
-        clave = st.text_input("PIN del trabajador" if rol_elegido == ROL_TRABAJADOR else "Contraseña",
+        clave = st.text_input("PIN de Santiago" if rol_elegido == ROL_TRABAJADOR else "Contraseña",
                               type="password", key=f"clave_{rol_elegido}")
         if clave and hmac.compare_digest(clave, secreto):
             st.session_state['rol'] = rol_elegido
             st.success({ROL_ADMIN: "Modo administrador activo", ROL_SOCIO: "Modo socio (solo lectura)",
-                        ROL_TRABAJADOR: "Modo trabajador activo"}[rol_elegido])
+                        ROL_TRABAJADOR: "Hola, Santiago"}[rol_elegido])
         elif clave:
             st.error("Contraseña incorrecta.")
         else:
