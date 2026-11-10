@@ -10,7 +10,11 @@ from modelos import Base, GastoSemanal, Registro # Modelos ORM de las tablas
 st.set_page_config(page_title="Control Lechero Agro", page_icon="🐄", layout="wide")
 
 ROL_SOCIO = "Socio (Solo Lectura)"
+ROL_TRABAJADOR = "Trabajador de la finca"
 ROL_ADMIN = "Administrador (Tú)"
+
+# Clave de cada rol dentro de [auth] en los secrets
+CLAVES_ROL = {ROL_ADMIN: "admin_password", ROL_SOCIO: "socio_password", ROL_TRABAJADOR: "trabajador_pin"}
 
 
 # =====================================================================
@@ -25,16 +29,22 @@ def consultar(sql, **params):
     # ttl=0: siempre datos frescos, así los socios ven al instante lo que registra el administrador
     return db().query(sql, params=params, ttl=0)
 
+def rol_actual():
+    return st.session_state.get('rol')
+
 def es_admin():
-    return st.session_state.get('es_admin', False)
+    return rol_actual() == ROL_ADMIN
+
+def exigir_rol(*permitidos):
+    # Toda escritura llama a esto; si el rol no tiene permiso se bloquea aunque la interfaz fallara
+    if rol_actual() not in permitidos:
+        raise PermissionError("Tu rol no tiene permiso para modificar estos datos.")
 
 def exigir_admin():
-    # Toda escritura llama a esto; si no es administrador se bloquea aunque la interfaz fallara
-    if not es_admin():
-        raise PermissionError("Solo el administrador puede modificar datos.")
+    exigir_rol(ROL_ADMIN)
 
-def ejecutar(sql, **params):
-    exigir_admin()
+def ejecutar(sql, permitidos=(ROL_ADMIN,), **params):
+    exigir_rol(*permitidos)
     with db().session as s:
         resultado = s.execute(text(sql), params)
         fila = resultado.first() if resultado.returns_rows else None
@@ -70,7 +80,7 @@ def guardar_registro(periodo_id, fecha, litros_m, litros_t):
                 DO UPDATE SET litros_manana = EXCLUDED.litros_manana,
                               litros_tarde = EXCLUDED.litros_tarde,
                               actualizado_en = now()''',
-             pid=periodo_id, fecha=fecha, m=litros_m, t=litros_t)
+             permitidos=(ROL_ADMIN, ROL_TRABAJADOR), pid=periodo_id, fecha=fecha, m=litros_m, t=litros_t)
 
 def obtener_registros(periodo_id=None):
     # Registros con los cálculos de litros y pago; si se pasa periodo_id, solo los de esa semana
@@ -289,10 +299,11 @@ def pesos(valor):
 def litros(valor):
     return f"{valor:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".") + " L"
 
-def etiqueta_periodo(fila):
+def etiqueta_periodo(fila, con_precio=True):
     inicio = pd.to_datetime(fila['fecha_inicio']).strftime('%d/%m/%Y')
     fin = pd.to_datetime(fila['fecha_fin']).strftime('%d/%m/%Y')
-    return f"Semana #{int(fila['id'])}  ·  {inicio} → {fin}  ·  {pesos(fila['precio_aplicado'])}/L"
+    etiqueta = f"Semana #{int(fila['id'])}  ·  {inicio} → {fin}"
+    return etiqueta + f"  ·  {pesos(fila['precio_aplicado'])}/L" if con_precio else etiqueta
 
 
 # =====================================================================
@@ -326,14 +337,28 @@ def seccion_registro():
         st.info("Todavía no hay periodos. Crea el primero arriba para empezar a registrar litros.")
         return
 
-    activo = periodos.iloc[0] # El último periodo creado es el activo
+    p_id, p_inicio, p_fin = formulario_ordeno(periodos.iloc[0]) # El último periodo creado es el activo
+
+    # Resumen rápido de lo registrado en el periodo activo
+    df_activo = obtener_registros(p_id)
+    if not df_activo.empty:
+        st.divider()
+        dias_periodo = (p_fin - p_inicio).days + 1
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total días registrados", f"{len(df_activo)} de {dias_periodo}", border=True)
+        c2.metric("Total litros del periodo", litros(df_activo['Total_Diario_Lts'].sum()), border=True)
+        c3.metric("Total a pagar hasta hoy", pesos(df_activo['Pago_Diario_$'].sum()), border=True)
+
+
+def formulario_ordeno(activo, con_precio=True):
+    # Litros de mañana y tarde de un día del periodo activo (lo usan el administrador y el trabajador)
     p_id = int(activo['id']) # int(): evita enviar a la base el tipo numpy.int64 que devuelve pandas
     p_inicio = pd.to_datetime(activo['fecha_inicio']).date()
     p_fin = pd.to_datetime(activo['fecha_fin']).date()
 
     with st.container(border=True):
         st.subheader("🥛 Registro diario de leche")
-        st.markdown(f"**Periodo activo:** {etiqueta_periodo(activo)}")
+        st.markdown(f"**Periodo activo:** {etiqueta_periodo(activo, con_precio)}")
 
         # Si hoy está dentro del periodo, se propone hoy; si no, el primer día
         sugerida = date.today() if p_inicio <= date.today() <= p_fin else p_inicio
@@ -358,15 +383,32 @@ def seccion_registro():
             guardar_registro(p_id, fecha_registro, litros_m, litros_t)
             st.success(f"Guardado: {litros(litros_m + litros_t)} en total para el {fecha_registro.strftime('%d/%m/%Y')}")
 
-    # Resumen rápido de lo registrado en el periodo activo
+    return p_id, p_inicio, p_fin
+
+
+# =====================================================================
+# SECCIÓN A2: 🥛 REGISTRO DIARIO DE ORDEÑOS (trabajador de la finca)
+# Solo litros: sin precios, pagos ni reportes
+# =====================================================================
+
+def seccion_ordenos():
+    st.title("🥛 Registro Diario de Ordeños")
+    st.caption("Anota los litros de la mañana y de la tarde.")
+
+    periodos = listar_periodos()
+    if periodos.empty:
+        st.info("Todavía no hay un periodo abierto. Pídele al administrador que lo cree.")
+        return
+
+    p_id, p_inicio, p_fin = formulario_ordeno(periodos.iloc[0], con_precio=False)
+
     df_activo = obtener_registros(p_id)
     if not df_activo.empty:
         st.divider()
         dias_periodo = (p_fin - p_inicio).days + 1
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total días registrados", f"{len(df_activo)} de {dias_periodo}", border=True)
-        c2.metric("Total litros del periodo", litros(df_activo['Total_Diario_Lts'].sum()), border=True)
-        c3.metric("Total a pagar hasta hoy", pesos(df_activo['Pago_Diario_$'].sum()), border=True)
+        c1, c2 = st.columns(2)
+        c1.metric("Días registrados", f"{len(df_activo)} de {dias_periodo}", border=True)
+        c2.metric("Litros del periodo", litros(df_activo['Total_Diario_Lts'].sum()), border=True)
 
 
 # =====================================================================
@@ -651,40 +693,65 @@ with st.sidebar:
     st.caption("Sistema de Administración Lechera")
     st.divider()
 
-    rol = st.selectbox("👤 Rol", [ROL_SOCIO, ROL_ADMIN])
-    st.session_state['es_admin'] = False
-    if rol == ROL_ADMIN:
-        clave = st.text_input("Contraseña de administrador", type="password")
-        if clave and hmac.compare_digest(clave, st.secrets["auth"]["admin_password"]):
-            st.session_state['es_admin'] = True
-            st.success("Modo administrador activo")
+    rol_elegido = st.selectbox("👤 Rol", [ROL_SOCIO, ROL_TRABAJADOR, ROL_ADMIN])
+    claves = {r: st.secrets["auth"].get(k) for r, k in CLAVES_ROL.items()}
+
+    # El rol se recalcula en cada ejecución: cambiar de rol o borrar la clave quita los permisos al instante.
+    # Sin socio_password en los secrets los socios entran sin clave (como antes); con ella, nadie ve
+    # datos sin autenticarse, y así el trabajador no puede elegir 'Socio' para ver las finanzas.
+    st.session_state['rol'] = None if claves[ROL_SOCIO] else ROL_SOCIO
+    secreto = claves[rol_elegido]
+    if rol_elegido == ROL_SOCIO and not secreto:
+        pass
+    elif not secreto:
+        st.error("Este rol no tiene contraseña configurada en los secrets.")
+    elif rol_elegido == ROL_TRABAJADOR and secreto in (claves[ROL_ADMIN], claves[ROL_SOCIO]):
+        st.error("El PIN del trabajador debe ser distinto al del administrador y al de los socios.")
+    else:
+        clave = st.text_input("PIN del trabajador" if rol_elegido == ROL_TRABAJADOR else "Contraseña",
+                              type="password", key=f"clave_{rol_elegido}")
+        if clave and hmac.compare_digest(clave, secreto):
+            st.session_state['rol'] = rol_elegido
+            st.success({ROL_ADMIN: "Modo administrador activo", ROL_SOCIO: "Modo socio (solo lectura)",
+                        ROL_TRABAJADOR: "Modo trabajador activo"}[rol_elegido])
         elif clave:
-            st.error("Contraseña incorrecta. Estás en modo lectura.")
+            st.error("Contraseña incorrecta.")
         else:
-            st.info("Escribe la contraseña para editar.")
+            st.info("Escribe la contraseña para entrar.")
 
     st.divider()
-    if es_admin():
+    if rol_actual() == ROL_ADMIN:
         SECCIONES = {
             "📝 Registro Operativo": seccion_registro,
             "💰 Facturación y Análisis": seccion_facturacion,
             "📈 Control Financiero": seccion_financiera,
             "⚙️ Configuración y Respaldo": seccion_configuracion,
         }
-    else:
+    elif rol_actual() == ROL_TRABAJADOR:
+        # El trabajador solo anota ordeños: nada de precios, finanzas ni reportes
+        SECCIONES = {"🥛 Registro Diario de Ordeños": seccion_ordenos}
+    elif rol_actual() == ROL_SOCIO:
         # Los socios solo consultan y exportan: facturación y liquidaciones financieras
         SECCIONES = {
             "💰 Facturación y Análisis": seccion_facturacion,
             "📈 Control Financiero": seccion_financiera,
         }
-    seccion = st.radio("Menú", list(SECCIONES.keys()), label_visibility="collapsed")
+    else:
+        SECCIONES = {}
+    seccion = st.radio("Menú", list(SECCIONES.keys()), label_visibility="collapsed") if SECCIONES else None
 
     st.divider()
     try:
         preparar_tablas_financieras()
-        st.caption(f"Precio vigente: {pesos(obtener_precio())}/L")
+        if rol_actual() in (ROL_ADMIN, ROL_SOCIO):
+            st.caption(f"Precio vigente: {pesos(obtener_precio())}/L")
     except Exception as e:
         st.error(f"No se pudo conectar a la base de datos ({type(e).__name__}). Revisa la URI en los secrets.")
         st.stop()
+
+if not seccion:
+    st.title("🐄 Control Lechero Agro")
+    st.info("Elige tu rol y escribe tu contraseña en el menú lateral para entrar.")
+    st.stop()
 
 SECCIONES[seccion]()
