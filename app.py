@@ -1,6 +1,6 @@
 import streamlit as st # Framework para crear la interfaz web de la aplicación
 import pandas as pd # Librería para manejar datos, cálculos y exportar a Excel
-from datetime import date, datetime, timedelta # Para manejar las fechas del calendario
+from datetime import date, datetime # Para manejar las fechas del calendario
 from io import BytesIO # Para generar el Excel en memoria
 from sqlalchemy import text, func, select # Consultas SQL con parámetros seguros y consultas ORM
 import hmac # Para comparar la contraseña de forma segura
@@ -57,41 +57,124 @@ def obtener_precio():
 def actualizar_precio(precio):
     ejecutar("UPDATE config SET precio_litro = :precio", precio=precio)
 
-def crear_periodo(fecha_inicio, fecha_fin, precio):
-    fila = ejecutar("INSERT INTO periodos (fecha_inicio, fecha_fin, precio_aplicado) "
-                    "VALUES (:inicio, :fin, :precio) RETURNING id",
-                    inicio=fecha_inicio, fin=fecha_fin, precio=precio)
-    return fila[0]
+# --- Bolsa de pendientes (periodo comodín) ---
+# Los días que todavía no se han facturado viven en un periodo invisible con esta fecha de inicio.
+# No se muestra en ningún selector ni reporte: solo en la tabla de pendientes.
+FECHA_COMODIN = date(2000, 1, 1)
+# Candado de PostgreSQL que ordena guardar ordeños y crear facturaciones, para que un día
+# no quede en la bolsa justo mientras se factura su rango
+CANDADO_BOLSA = 727001
+
+# Facturación real (no comodín) cuyo rango incluye la fecha; si hay varias, gana la que ya tiene ese día
+SQL_FACTURACION_DE_FECHA = '''
+    SELECT p.id, p.fecha_inicio, p.fecha_fin, p.precio_aplicado, r.litros_manana, r.litros_tarde
+    FROM periodos p
+    LEFT JOIN registros r ON r.periodo_id = p.id AND r.fecha = :fecha
+    WHERE p.fecha_inicio <> :comodin AND :fecha BETWEEN p.fecha_inicio AND p.fecha_fin
+    ORDER BY (r.id IS NULL), p.id DESC
+    LIMIT 1
+'''
+
+def bloquear_bolsa(s):
+    # El candado se libera solo al terminar la transacción (commit o rollback)
+    s.execute(text("SELECT pg_advisory_xact_lock(:k)"), {'k': CANDADO_BOLSA})
+
+def id_bolsa(s):
+    # Busca el periodo comodín y, si no existe, lo crea (dentro de la transacción con candado)
+    pid = s.scalar(text("SELECT min(id) FROM periodos WHERE fecha_inicio = :c"), {'c': FECHA_COMODIN})
+    if pid is None:
+        # precio_aplicado no puede ser nulo; en la bolsa no se usa (cada facturación toma el precio vigente)
+        precio = s.scalar(text("SELECT precio_litro FROM config ORDER BY id LIMIT 1")) or 0
+        pid = s.scalar(text("INSERT INTO periodos (fecha_inicio, fecha_fin, precio_aplicado) "
+                            "VALUES (:c, :c, :precio) RETURNING id"), {'c': FECHA_COMODIN, 'precio': precio})
+    return int(pid)
 
 def listar_periodos():
-    # Todos los periodos, del más reciente al más antiguo
-    return consultar("SELECT id, fecha_inicio, fecha_fin, precio_aplicado FROM periodos ORDER BY id DESC")
+    # Facturaciones reales, de la más reciente a la más antigua (sin la bolsa de pendientes)
+    return consultar("SELECT id, fecha_inicio, fecha_fin, precio_aplicado FROM periodos "
+                     "WHERE fecha_inicio <> :comodin ORDER BY id DESC", comodin=FECHA_COMODIN)
 
-def obtener_registro(periodo_id, fecha):
-    df = consultar("SELECT litros_manana, litros_tarde FROM registros WHERE periodo_id = :pid AND fecha = :fecha",
-                   pid=periodo_id, fecha=fecha)
-    return None if df.empty else (float(df.iloc[0, 0]), float(df.iloc[0, 1]))
+def estado_fecha(fecha):
+    # Devuelve (facturación cerrada que contiene la fecha o None, (litros_m, litros_t) ya guardados o None)
+    df = consultar(SQL_FACTURACION_DE_FECHA, fecha=fecha, comodin=FECHA_COMODIN)
+    if not df.empty:
+        fila = df.iloc[0]
+        existente = None if pd.isna(fila['litros_manana']) else (float(fila['litros_manana']),
+                                                                 float(fila['litros_tarde']))
+        return fila, existente
+    df = consultar('''SELECT r.litros_manana, r.litros_tarde FROM registros r
+                      JOIN periodos p ON p.id = r.periodo_id
+                      WHERE p.fecha_inicio = :comodin AND r.fecha = :fecha
+                      ORDER BY p.id LIMIT 1''', fecha=fecha, comodin=FECHA_COMODIN)
+    return None, None if df.empty else (float(df.iloc[0, 0]), float(df.iloc[0, 1]))
 
-def guardar_registro(periodo_id, fecha, litros_m, litros_t):
-    # Si el día ya existe en el periodo se actualiza; si no, se inserta
-    ejecutar('''INSERT INTO registros (periodo_id, fecha, litros_manana, litros_tarde)
-                VALUES (:pid, :fecha, :m, :t)
-                ON CONFLICT (periodo_id, fecha)
-                DO UPDATE SET litros_manana = EXCLUDED.litros_manana,
-                              litros_tarde = EXCLUDED.litros_tarde,
-                              actualizado_en = now()''',
-             permitidos=(ROL_ADMIN, ROL_TRABAJADOR), pid=periodo_id, fecha=fecha, m=litros_m, t=litros_t)
+def guardar_registro(fecha, litros_m, litros_t):
+    # Si la fecha cae en una facturación cerrada, se guarda (o corrige) allí; si no, va a la bolsa.
+    # Devuelve el id de la facturación cerrada que se modificó, o None si quedó en pendientes.
+    exigir_rol(ROL_ADMIN, ROL_TRABAJADOR)
+    with db().session as s:
+        bloquear_bolsa(s)
+        fila = s.execute(text(SQL_FACTURACION_DE_FECHA), {'fecha': fecha, 'comodin': FECHA_COMODIN}).first()
+        cerrada = int(fila[0]) if fila else None
+        s.execute(text('''INSERT INTO registros (periodo_id, fecha, litros_manana, litros_tarde)
+                          VALUES (:pid, :fecha, :m, :t)
+                          ON CONFLICT (periodo_id, fecha)
+                          DO UPDATE SET litros_manana = EXCLUDED.litros_manana,
+                                        litros_tarde = EXCLUDED.litros_tarde,
+                                        actualizado_en = now()'''),
+                  {'pid': cerrada if cerrada else id_bolsa(s), 'fecha': fecha, 'm': litros_m, 't': litros_t})
+        s.commit()
+    return cerrada
+
+def obtener_pendientes():
+    # Días que están en la bolsa, esperando a ser facturados
+    df = consultar('''SELECT r.fecha, r.litros_manana, r.litros_tarde
+                      FROM registros r JOIN periodos p ON p.id = r.periodo_id
+                      WHERE p.fecha_inicio = :comodin ORDER BY r.fecha''', comodin=FECHA_COMODIN)
+    df['fecha'] = pd.to_datetime(df['fecha']).dt.date
+    df['Total_Diario_Lts'] = df['litros_manana'] + df['litros_tarde']
+    return df
+
+def crear_facturacion(fecha_inicio, fecha_fin, precio):
+    # Crea la facturación y le pasa, en la misma transacción, los días pendientes de ese rango.
+    # Devuelve (id nuevo, días movidos). Lanza ValueError si no se puede crear.
+    exigir_admin()
+    if fecha_inicio <= FECHA_COMODIN:
+        raise ValueError(f"La fecha de inicio debe ser posterior al {FECHA_COMODIN.strftime('%d/%m/%Y')}.")
+    rango = {'ini': fecha_inicio, 'fin': fecha_fin, 'c': FECHA_COMODIN}
+    with db().session as s:
+        bloquear_bolsa(s)
+        solapada = s.execute(text('''SELECT id, fecha_inicio, fecha_fin FROM periodos
+                                     WHERE fecha_inicio <> :c AND fecha_inicio <= :fin AND fecha_fin >= :ini
+                                     ORDER BY id LIMIT 1'''), rango).first()
+        if solapada:
+            raise ValueError(f"El rango se cruza con la Facturación #{solapada[0]} "
+                             f"({solapada[1].strftime('%d/%m/%Y')} → {solapada[2].strftime('%d/%m/%Y')}). "
+                             "Cada día solo puede pertenecer a una facturación.")
+        nuevo_id = s.scalar(text("INSERT INTO periodos (fecha_inicio, fecha_fin, precio_aplicado) "
+                                 "VALUES (:ini, :fin, :precio) RETURNING id"), {**rango, 'precio': precio})
+        movidos = s.execute(text('''UPDATE registros SET periodo_id = :nuevo
+                                    WHERE fecha BETWEEN :ini AND :fin
+                                      AND periodo_id IN (SELECT id FROM periodos WHERE fecha_inicio = :c)'''),
+                            {**rango, 'nuevo': nuevo_id}).rowcount
+        if movidos == 0:
+            s.rollback() # No se deja una facturación vacía
+            raise ValueError("No hay días pendientes por facturar en ese rango.")
+        s.commit()
+    return int(nuevo_id), movidos
 
 def obtener_registros(periodo_id=None):
-    # Registros con los cálculos de litros y pago; si se pasa periodo_id, solo los de esa semana
+    # Registros facturados con los cálculos de litros y pago; si se pasa periodo_id, solo los de esa facturación.
+    # Los días de la bolsa de pendientes no aparecen en reportes.
     consulta = '''
         SELECT r.periodo_id, r.fecha, r.litros_manana, r.litros_tarde, p.precio_aplicado
         FROM registros r
         JOIN periodos p ON r.periodo_id = p.id
+        WHERE p.fecha_inicio <> :comodin
     '''
-    params = {}
+    params = {'comodin': FECHA_COMODIN}
     if periodo_id is not None:
-        consulta += " WHERE r.periodo_id = :pid"
+        consulta += " AND r.periodo_id = :pid"
         params['pid'] = periodo_id
     consulta += " ORDER BY r.fecha"
     df = consultar(consulta, **params)
@@ -269,7 +352,7 @@ def excel_financiero(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter', date_format='dd/mm/yyyy') as writer:
         escribir_hoja(writer, df, 'Reporte Financiero', {
-            'periodo_id': ('Semana #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
+            'periodo_id': ('Facturación #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
             'fecha_fin': ('Fecha fin', 'fecha'), 'litros_totales': ('Litros totales', 'litros'),
             'precio_venta_litro': ('Precio venta litro', 'pesos'), 'ingresos_leche': ('Ingresos leche', 'pesos'),
             'costo_cuidos': ('Costo cuidos', 'pesos'), 'costos_fijos': ('Costos fijos', 'pesos'),
@@ -280,7 +363,7 @@ def excel_financiero(df):
         }, sumables={'litros_totales', 'ingresos_leche', 'costo_cuidos', 'costos_fijos',
                      'costo_total_semana', 'utilidad_neta_semana'})
         escribir_hoja(writer, detalle, 'Detalle Cuidos', {
-            'periodo_id': ('Semana #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
+            'periodo_id': ('Facturación #', None), 'fecha_inicio': ('Fecha inicio', 'fecha'),
             'fecha_fin': ('Fecha fin', 'fecha'), 'insumo': ('Insumo', None), 'detalle': ('Detalle', None),
             'cantidad_bultos': ('Bultos', 'litros'), 'precio_bulto': ('Precio bulto', 'pesos'),
             'subtotal': ('Subtotal', 'pesos'),
@@ -302,7 +385,7 @@ def litros(valor):
 def etiqueta_periodo(fila, con_precio=True):
     inicio = pd.to_datetime(fila['fecha_inicio']).strftime('%d/%m/%Y')
     fin = pd.to_datetime(fila['fecha_fin']).strftime('%d/%m/%Y')
-    etiqueta = f"Semana #{int(fila['id'])}  ·  {inicio} → {fin}"
+    etiqueta = f"Facturación #{int(fila['id'])}  ·  {inicio} → {fin}"
     return etiqueta + f"  ·  {pesos(fila['precio_aplicado'])}/L" if con_precio else etiqueta
 
 
@@ -312,78 +395,76 @@ def etiqueta_periodo(fila, con_precio=True):
 
 def seccion_registro():
     st.title("📝 Registro Operativo")
-    st.caption("Crea el plazo de recolección y anota los litros de cada ordeño.")
-
-    # --- Crear periodo ---
-    with st.container(border=True):
-        st.subheader("📅 Nuevo plazo de recolección")
-        col1, col2, col3 = st.columns([2, 2, 1.3], vertical_alignment="bottom")
-        fecha_inicio = col1.date_input("Día de inicio", date.today(), format="DD/MM/YYYY")
-        fecha_fin = col2.date_input("Día de fin", date.today() + timedelta(days=6), format="DD/MM/YYYY") # Por defecto 7 días
-        if col3.button("➕ Crear periodo", type="primary", width="stretch"):
-            if fecha_fin < fecha_inicio:
-                st.error("El día de fin no puede ser anterior al día de inicio.")
-            else:
-                precio = obtener_precio()
-                nuevo_id = crear_periodo(fecha_inicio, fecha_fin, precio)
-                st.toast(f"Semana #{nuevo_id} creada con precio {pesos(precio)}/L", icon="✅")
-        st.caption(f"Se aplicará el precio vigente: **{pesos(obtener_precio())}** por litro (se cambia en ⚙️ Configuración).")
-
-    st.divider()
-
-    # --- Registro diario ---
-    periodos = listar_periodos()
-    if periodos.empty:
-        st.info("Todavía no hay periodos. Crea el primero arriba para empezar a registrar litros.")
-        return
-
-    p_id, p_inicio, p_fin = formulario_ordeno(periodos.iloc[0]) # El último periodo creado es el activo
-
-    # Resumen rápido de lo registrado en el periodo activo
-    df_activo = obtener_registros(p_id)
-    if not df_activo.empty:
-        st.divider()
-        dias_periodo = (p_fin - p_inicio).days + 1
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total días registrados", f"{len(df_activo)} de {dias_periodo}", border=True)
-        c2.metric("Total litros del periodo", litros(df_activo['Total_Diario_Lts'].sum()), border=True)
-        c3.metric("Total a pagar hasta hoy", pesos(df_activo['Pago_Diario_$'].sum()), border=True)
+    st.caption("Anota los litros de cualquier día. Los días nuevos quedan pendientes hasta que los factures "
+               "en 📈 Control Financiero.")
+    formulario_ordeno(con_precio=True)
+    tabla_pendientes(con_precio=True)
 
 
-def formulario_ordeno(activo, con_precio=True):
-    # Litros de mañana y tarde de un día del periodo activo (lo usan el administrador y el trabajador)
-    p_id = int(activo['id']) # int(): evita enviar a la base el tipo numpy.int64 que devuelve pandas
-    p_inicio = pd.to_datetime(activo['fecha_inicio']).date()
-    p_fin = pd.to_datetime(activo['fecha_fin']).date()
-
+def formulario_ordeno(con_precio=True):
+    # Litros de mañana y tarde de cualquier fecha, sin periodo abierto (lo usan el administrador y el trabajador)
     with st.container(border=True):
         st.subheader("🥛 Registro diario de leche")
-        st.markdown(f"**Periodo activo:** {etiqueta_periodo(activo, con_precio)}")
-
-        # Si hoy está dentro del periodo, se propone hoy; si no, el primer día
-        sugerida = date.today() if p_inicio <= date.today() <= p_fin else p_inicio
-        fecha_registro = st.date_input("Fecha a registrar", sugerida, min_value=p_inicio, max_value=p_fin,
+        fecha_registro = st.date_input("Fecha a registrar", date.today(), max_value=date.today(),
                                        format="DD/MM/YYYY")
 
-        # Si ese día ya tiene datos, se cargan para poder corregirlos
-        existente = obtener_registro(p_id, fecha_registro)
-        if existente:
-            st.info("Este día ya tiene un registro. Si guardas, se reemplazará.")
+        # ¿El día ya está en una facturación cerrada o en la bolsa? Si tiene datos, se cargan para corregirlos
+        facturacion, existente = estado_fecha(fecha_registro)
+        if facturacion is not None:
+            st.warning(f"Este día pertenece a la {etiqueta_periodo(facturacion, con_precio)}, que ya está cerrada. "
+                       "Si guardas, se actualizará el registro de esa facturación.")
+        elif existente:
+            st.info("Este día ya está en los pendientes por facturar. Si guardas, se reemplazará.")
         valor_m, valor_t = existente if existente else (0.0, 0.0)
 
         col_m, col_t = st.columns(2)
         litros_m = col_m.number_input("☀️ Litros Mañana", min_value=0.0, step=1.0, value=valor_m,
-                                      key=f"m_{p_id}_{fecha_registro}")
+                                      key=f"m_{fecha_registro}")
         litros_t = col_t.number_input("🌙 Litros Tarde", min_value=0.0, step=1.0, value=valor_t,
-                                      key=f"t_{p_id}_{fecha_registro}")
+                                      key=f"t_{fecha_registro}")
 
         st.metric("Total del día", litros(litros_m + litros_t))
 
         if st.button("💾 Guardar registro diario", type="primary", width="stretch"):
-            guardar_registro(p_id, fecha_registro, litros_m, litros_t)
-            st.success(f"Guardado: {litros(litros_m + litros_t)} en total para el {fecha_registro.strftime('%d/%m/%Y')}")
+            total = litros(litros_m + litros_t)
+            dia = fecha_registro.strftime('%d/%m/%Y')
+            cerrada = guardar_registro(fecha_registro, litros_m, litros_t)
+            if cerrada:
+                aviso = f"Se actualizó el {dia} ({total}) dentro de la Facturación #{cerrada}, que ya estaba cerrada."
+                if con_precio:
+                    aviso += (" Si esa facturación ya tiene liquidación en 📈 Control Financiero, "
+                              "vuelve a guardarla para que use los litros nuevos.")
+                st.warning(aviso)
+            else:
+                st.success(f"Guardado en pendientes por facturar: {total} en total para el {dia}.")
 
-    return p_id, p_inicio, p_fin
+
+def tabla_pendientes(con_precio=True):
+    # Resumen de la bolsa: días registrados que todavía no pertenecen a ninguna facturación
+    df = obtener_pendientes()
+    with st.container(border=True):
+        st.subheader("🧺 Días pendientes por facturar")
+        if df.empty:
+            st.info("No hay días pendientes. Todo lo registrado ya está facturado.")
+            return
+
+        columnas = st.columns(3 if con_precio else 2)
+        columnas[0].metric("Días pendientes", len(df), border=True)
+        columnas[1].metric("Litros pendientes", litros(df['Total_Diario_Lts'].sum()), border=True)
+        if con_precio:
+            columnas[2].metric("Valor estimado (precio vigente)",
+                               pesos(df['Total_Diario_Lts'].sum() * obtener_precio()), border=True)
+
+        st.dataframe(
+            df[['fecha', 'litros_manana', 'litros_tarde', 'Total_Diario_Lts']],
+            hide_index=True, width="stretch",
+            column_config={
+                'fecha': st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
+                'litros_manana': st.column_config.NumberColumn("Mañana (L)", format="%.1f"),
+                'litros_tarde': st.column_config.NumberColumn("Tarde (L)", format="%.1f"),
+                'Total_Diario_Lts': st.column_config.NumberColumn("Total del día (L)", format="%.1f"),
+            },
+        )
 
 
 # =====================================================================
@@ -393,22 +474,9 @@ def formulario_ordeno(activo, con_precio=True):
 
 def seccion_ordenos():
     st.title("🥛 Registro Diario de Ordeños")
-    st.caption("Anota los litros de la mañana y de la tarde.")
-
-    periodos = listar_periodos()
-    if periodos.empty:
-        st.info("Todavía no hay un periodo abierto. Pídele al administrador que lo cree.")
-        return
-
-    p_id, p_inicio, p_fin = formulario_ordeno(periodos.iloc[0], con_precio=False)
-
-    df_activo = obtener_registros(p_id)
-    if not df_activo.empty:
-        st.divider()
-        dias_periodo = (p_fin - p_inicio).days + 1
-        c1, c2 = st.columns(2)
-        c1.metric("Días registrados", f"{len(df_activo)} de {dias_periodo}", border=True)
-        c2.metric("Litros del periodo", litros(df_activo['Total_Diario_Lts'].sum()), border=True)
+    st.caption("Elige el día y anota los litros de la mañana y de la tarde.")
+    formulario_ordeno(con_precio=False)
+    tabla_pendientes(con_precio=False)
 
 
 # =====================================================================
@@ -420,20 +488,20 @@ def seccion_facturacion():
 
     periodos = listar_periodos()
     if periodos.empty:
-        st.info("No hay periodos creados todavía.")
+        st.info("No hay facturaciones creadas todavía.")
         return
 
-    # --- Liquidación semanal ---
+    # --- Liquidación de la facturación ---
     with st.container(border=True):
-        st.subheader("🧾 Liquidación de la semana")
-        # Las opciones son los IDs reales de la tabla 'periodos'; la etiqueta solo es lo que se ve
+        st.subheader("🧾 Liquidación de la facturación")
+        # Las opciones son los IDs reales de la tabla 'periodos' (sin la bolsa); la etiqueta solo es lo que se ve
         etiquetas = {int(fila['id']): etiqueta_periodo(fila) for _, fila in periodos.iterrows()}
-        semana_id = st.selectbox("Semana facturada", options=list(etiquetas.keys()),
+        semana_id = st.selectbox("Facturación", options=list(etiquetas.keys()),
                                  format_func=lambda pid: etiquetas[pid])
 
         df_semana = obtener_registros(semana_id)
         if df_semana.empty:
-            st.warning("Esta semana todavía no tiene registros de leche.")
+            st.warning("Esta facturación no tiene registros de leche.")
         else:
             total_m = df_semana['litros_manana'].sum()
             total_t = df_semana['litros_tarde'].sum()
@@ -441,8 +509,8 @@ def seccion_facturacion():
             total_pago = df_semana['Pago_Diario_$'].sum()
 
             c1, c2 = st.columns(2)
-            c1.metric("💵 Total a pagar de la semana", pesos(total_pago), border=True)
-            c2.metric("🥛 Total litros de la semana", litros(total_lts), border=True)
+            c1.metric("💵 Total a pagar de la facturación", pesos(total_pago), border=True)
+            c2.metric("🥛 Total litros de la facturación", litros(total_lts), border=True)
 
             c3, c4, c5 = st.columns(3)
             c3.metric("☀️ Total litros mañana", litros(total_m), border=True)
@@ -484,10 +552,10 @@ def seccion_facturacion():
     # --- Exportación ---
     with st.container(border=True):
         st.subheader("📥 Exportar")
-        st.caption("El Excel incluye una hoja con la semana seleccionada y otra con todo el histórico.")
+        st.caption("El Excel incluye una hoja con la facturación seleccionada y otra con todo el histórico facturado.")
         st.download_button(label="📥 Descargar Excel",
-                           data=generar_excel({'Semana Facturada': df_semana, 'Histórico': df_historico}),
-                           file_name=f"Reporte_Lechero_Semana_{semana_id}.xlsx",
+                           data=generar_excel({'Facturación': df_semana, 'Histórico': df_historico}),
+                           file_name=f"Reporte_Lechero_Facturacion_{semana_id}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            type="primary", width="stretch")
 
@@ -506,7 +574,7 @@ def seccion_configuracion():
         precio_actual = obtener_precio()
         st.metric("Total precio vigente por litro", pesos(precio_actual))
         nuevo_precio = st.number_input("Nuevo precio por litro ($)", value=precio_actual, min_value=0.0, step=10.0)
-        st.caption("El cambio se aplica a los periodos que crees desde ahora; los ya creados conservan su precio.")
+        st.caption("El cambio se aplica a las facturaciones que crees desde ahora; las ya creadas conservan su precio.")
         if st.button("Actualizar precio", type="primary", width="stretch"):
             actualizar_precio(nuevo_precio)
             st.success(f"Precio actualizado a {pesos(nuevo_precio)} por litro.")
@@ -527,23 +595,73 @@ def seccion_configuracion():
 # (administrador registra; socios consultan y exportan)
 # =====================================================================
 
-def seccion_financiera():
-    st.title("📈 Control Financiero")
-    st.caption("Ingresos, costos, punto de equilibrio y utilidad de cada semana.")
+def facturacion_a_la_carta():
+    # El administrador elige el rango real de recolección y los días pendientes de ese rango pasan a la facturación
+    if 'aviso_facturacion' in st.session_state:
+        st.success(st.session_state.pop('aviso_facturacion'))
 
-    if es_admin():
-        periodos = listar_periodos()
-        if periodos.empty:
-            st.info("No hay periodos creados todavía. Ve a 📝 Registro Operativo para crear el primero.")
+    pendientes = obtener_pendientes()
+    with st.container(border=True):
+        st.subheader("🧾 Facturación a la carta")
+        if pendientes.empty:
+            st.info("No hay días pendientes por facturar. Regístralos en 📝 Registro Operativo.")
             return
 
-        # --- 1. Semana y producción ---
+        # Por defecto se propone el rango completo de la bolsa
+        col1, col2, col3 = st.columns([2, 2, 1.3], vertical_alignment="bottom")
+        fecha_inicio = col1.date_input("Fecha de inicio", pendientes['fecha'].min(), format="DD/MM/YYYY",
+                                       key="fact_inicio")
+        fecha_fin = col2.date_input("Fecha de fin", pendientes['fecha'].max(), format="DD/MM/YYYY",
+                                    key="fact_fin")
+
+        en_rango = pendientes[(pendientes['fecha'] >= fecha_inicio) & (pendientes['fecha'] <= fecha_fin)]
+        precio = obtener_precio()
+        crear = col3.button("➕ Crear Facturación", type="primary", width="stretch")
+
+        st.caption(f"Entran **{len(en_rango)}** de {len(pendientes)} días pendientes "
+                   f"({litros(en_rango['Total_Diario_Lts'].sum())}), con el precio vigente de "
+                   f"**{pesos(precio)}** por litro (se cambia en ⚙️ Configuración).")
+
+        if crear:
+            if fecha_fin < fecha_inicio:
+                st.error("La fecha de fin no puede ser anterior a la fecha de inicio.")
+            else:
+                try:
+                    nuevo_id, movidos = crear_facturacion(fecha_inicio, fecha_fin, precio)
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.session_state['aviso_facturacion'] = (
+                        f"Facturación #{nuevo_id} creada ({fecha_inicio.strftime('%d/%m/%Y')} → "
+                        f"{fecha_fin.strftime('%d/%m/%Y')}) con {movidos} días y precio {pesos(precio)}/L.")
+                    st.session_state['fin_periodo'] = nuevo_id # Queda seleccionada para liquidarla abajo
+                    for clave in ('fact_inicio', 'fact_fin'):
+                        st.session_state.pop(clave, None)
+                    st.rerun()
+
+
+def seccion_financiera():
+    st.title("📈 Control Financiero")
+    st.caption("Crea facturaciones con los días pendientes y calcula ingresos, costos, punto de equilibrio "
+               "y utilidad de cada una.")
+
+    if es_admin():
+        facturacion_a_la_carta()
+
+        periodos = listar_periodos()
+        if periodos.empty:
+            st.info("No hay facturaciones creadas todavía. Crea la primera arriba con los días pendientes.")
+            return
+
+        # --- 1. Facturación y producción ---
         with st.container(border=True):
-            st.subheader("🥛 1. Semana a liquidar")
+            st.subheader("🥛 1. Facturación a liquidar")
             col1, col2 = st.columns([3, 1.3], vertical_alignment="bottom")
-            # Las opciones son los IDs reales de la tabla 'periodos'; la etiqueta solo es lo que se ve
+            # Las opciones son los IDs reales de la tabla 'periodos' (sin la bolsa); la etiqueta solo es lo que se ve
             etiquetas = {int(fila['id']): etiqueta_periodo(fila) for _, fila in periodos.iterrows()}
-            periodo_id = col1.selectbox("Semana (periodo)", options=list(etiquetas.keys()),
+            if st.session_state.get('fin_periodo') not in etiquetas:
+                st.session_state.pop('fin_periodo', None) # La facturación elegida ya no existe
+            periodo_id = col1.selectbox("Facturación", options=list(etiquetas.keys()),
                                         format_func=lambda pid: etiquetas[pid], key="fin_periodo")
             precio_periodo = float(periodos.loc[periodos['id'] == periodo_id, 'precio_aplicado'].iloc[0])
             # Se consulta a la base cada vez que cambia la semana
@@ -662,7 +780,7 @@ def seccion_financiera():
                 'punto_equilibrio_litro', 'utilidad_neta_semana']],
             hide_index=True, width="stretch",
             column_config={
-                'periodo_id': st.column_config.NumberColumn("Semana #", format="%d"),
+                'periodo_id': st.column_config.NumberColumn("Facturación #", format="%d"),
                 'fecha_inicio': st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
                 'fecha_fin': st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
                 'litros_totales': st.column_config.NumberColumn("Litros", format="%.1f"),
