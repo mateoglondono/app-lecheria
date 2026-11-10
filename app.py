@@ -1,9 +1,12 @@
 import streamlit as st # Framework para crear la interfaz web de la aplicación
 import pandas as pd # Librería para manejar datos, cálculos y exportar a Excel
-from datetime import date, datetime # Para manejar las fechas del calendario
+from datetime import date, datetime, timedelta # Para manejar las fechas del calendario
 from io import BytesIO # Para generar el Excel en memoria
 from sqlalchemy import text, func, select # Consultas SQL con parámetros seguros y consultas ORM
 import hmac # Para comparar la contraseña de forma segura
+import html # Para escapar textos dentro del correo HTML
+import smtplib # Envío de correos por Gmail (librería estándar)
+from email.message import EmailMessage # Para armar el correo con versión texto y HTML
 from modelos import Base, GastoSemanal, Registro # Modelos ORM de las tablas
 
 # Configuración de la página en el navegador
@@ -198,6 +201,7 @@ def respaldo_completo():
         'periodos': consultar("SELECT * FROM periodos ORDER BY id"),
         'registros': consultar("SELECT * FROM registros ORDER BY id"),
         'gastos_semanales': consultar("SELECT * FROM gastos_semanales ORDER BY id"),
+        'gestaciones': consultar("SELECT * FROM gestaciones ORDER BY id"),
     })
 
 
@@ -219,11 +223,19 @@ CUIDOS = {
 
 @st.cache_resource
 def preparar_tablas_financieras():
-    # Crea gastos_semanales si no existe (una sola vez por servidor) y la protege de la API pública de Supabase
+    # Crea gastos_semanales y gestaciones si no existen (una sola vez por servidor)
+    # y las protege de la API pública de Supabase
     engine = db().engine
     Base.metadata.create_all(engine, tables=[GastoSemanal.__table__])
     with engine.begin() as c:
         c.execute(text("ALTER TABLE gastos_semanales ENABLE ROW LEVEL SECURITY"))
+        c.execute(text('''CREATE TABLE IF NOT EXISTS gestaciones (
+                              id SERIAL PRIMARY KEY,
+                              nombre_vaca TEXT NOT NULL,
+                              fecha_monta DATE NOT NULL,
+                              fecha_parto_estimada DATE NOT NULL
+                          )'''))
+        c.execute(text("ALTER TABLE gestaciones ENABLE ROW LEVEL SECURITY"))
 
 def litros_producidos(periodo_id, session):
     # Suma de (mañana + tarde) de todos los ordeños del periodo
@@ -369,6 +381,73 @@ def excel_financiero(df):
             'subtotal': ('Subtotal', 'pesos'),
         }, sumables={'cantidad_bultos', 'subtotal'})
     return output.getvalue()
+
+
+# --- Manejo reproductivo y reporte por correo ---
+
+DIAS_GESTACION = 283 # Duración promedio de la gestación bovina
+
+def guardar_gestacion(nombre_vaca, fecha_monta, fecha_parto):
+    fila = ejecutar("INSERT INTO gestaciones (nombre_vaca, fecha_monta, fecha_parto_estimada) "
+                    "VALUES (:vaca, :monta, :parto) RETURNING id",
+                    vaca=nombre_vaca, monta=fecha_monta, parto=fecha_parto)
+    return int(fila[0])
+
+def listar_gestaciones_activas():
+    # Gestaciones cuyo parto estimado todavía no ha pasado, la más próxima primero
+    df = consultar('''SELECT id, nombre_vaca, fecha_monta, fecha_parto_estimada FROM gestaciones
+                      WHERE fecha_parto_estimada >= :hoy ORDER BY fecha_parto_estimada, id''', hoy=date.today())
+    for col in ('fecha_monta', 'fecha_parto_estimada'):
+        df[col] = pd.to_datetime(df[col]).dt.date
+    df['dias_faltantes'] = [(f - date.today()).days for f in df['fecha_parto_estimada']]
+    return df
+
+def enviar_reporte_socios(df_gestaciones):
+    # Envía por Gmail a los socios la lista de gestaciones activas. Devuelve a cuántos se envió.
+    # Lanza KeyError si faltan secrets, ValueError si no hay destinatarios, o el error de SMTP si Gmail falla.
+    config = st.secrets["email"]
+    remitente, password = config["remitente"], config["password"]
+    socios = config["socios"]
+    socios = [socios] if isinstance(socios, str) else [s for s in socios if s] # Por si es un solo correo
+    if not socios:
+        raise ValueError("La lista de socios en los secrets está vacía.")
+
+    hoy = date.today().strftime('%d/%m/%Y')
+    filas = [(str(f['nombre_vaca']), f['fecha_monta'].strftime('%d/%m/%Y'),
+              f['fecha_parto_estimada'].strftime('%d/%m/%Y'), int(f['dias_faltantes']))
+             for _, f in df_gestaciones.iterrows()]
+
+    # Versión en texto plano (para lectores de correo sin HTML)
+    texto = [f"Reporte reproductivo - {hoy}", f"Gestaciones activas: {len(filas)}", ""]
+    texto += [f"- {vaca}: monta {monta}, parto estimado {parto} (faltan {dias} días)"
+              for vaca, monta, parto, dias in filas] or ["No hay gestaciones activas."]
+
+    # Versión HTML con tabla
+    celda = 'style="padding:6px 12px;border:1px solid #ccc"'
+    cuerpo_tabla = "".join(
+        f"<tr><td {celda}>{html.escape(vaca)}</td><td {celda}>{monta}</td>"
+        f"<td {celda}><b>{parto}</b></td><td {celda} align='right'>{dias}</td></tr>"
+        for vaca, monta, parto, dias in filas)
+    contenido = (f"<table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px'>"
+                 f"<tr style='background:#e8f5e9'><th {celda}>Vaca</th><th {celda}>Fecha de monta</th>"
+                 f"<th {celda}>Parto estimado</th><th {celda}>Días faltantes</th></tr>{cuerpo_tabla}</table>"
+                 if filas else "<p>No hay gestaciones activas.</p>")
+    cuerpo_html = (f"<div style='font-family:Arial,sans-serif'><h2>🐮 Reporte reproductivo</h2>"
+                   f"<p>Fecha del reporte: {hoy} · Gestaciones activas: <b>{len(filas)}</b></p>{contenido}"
+                   f"<p style='color:#777;font-size:12px'>Parto estimado = monta + {DIAS_GESTACION} días. "
+                   f"Enviado desde Control Lechero Agro.</p></div>")
+
+    mensaje = EmailMessage()
+    mensaje['Subject'] = f"🐮 Reporte reproductivo - {hoy}"
+    mensaje['From'] = remitente
+    mensaje['To'] = ", ".join(socios)
+    mensaje.set_content("\n".join(texto))
+    mensaje.add_alternative(cuerpo_html, subtype='html')
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=20) as servidor:
+        servidor.login(remitente, password)
+        servidor.send_message(mensaje)
+    return len(socios)
 
 
 # =====================================================================
@@ -803,6 +882,77 @@ def seccion_financiera():
 
 
 # =====================================================================
+# SECCIÓN E: 🐮 MANEJO REPRODUCTIVO
+# (administrador registra montas; socios consultan)
+# =====================================================================
+
+def seccion_reproductivo():
+    st.title("🐮 Manejo Reproductivo")
+    st.caption(f"Registra las preñeces y calcula el parto estimado ({DIAS_GESTACION} días). "
+               + ("El reporte se puede enviar por correo a los socios." if es_admin()
+                  else "El administrador envía este reporte por correo a los socios."))
+
+    if es_admin():
+        with st.container(border=True):
+            st.subheader("📝 Nueva preñez")
+            with st.form("form_gestacion", clear_on_submit=True, border=False):
+                col1, col2 = st.columns(2)
+                nombre_vaca = col1.text_input("Nombre/Número de la Vaca")
+                fecha_monta = col2.date_input("Fecha de Inseminación/Monta", date.today(), max_value=date.today(),
+                                              format="DD/MM/YYYY")
+                guardar = st.form_submit_button("💾 Guardar preñez", type="primary", width="stretch")
+
+            if guardar:
+                nombre_vaca = nombre_vaca.strip()
+                if not nombre_vaca:
+                    st.error("Escribe el nombre o número de la vaca.")
+                else:
+                    fecha_parto = fecha_monta + timedelta(days=DIAS_GESTACION)
+                    guardar_gestacion(nombre_vaca, fecha_monta, fecha_parto)
+                    st.success(f"Preñez de {nombre_vaca} guardada. Parto estimado: "
+                               f"{fecha_parto.strftime('%d/%m/%Y')}.")
+
+    # --- Gestaciones activas (todos los roles con acceso) ---
+    df = listar_gestaciones_activas()
+    with st.container(border=True):
+        st.subheader("🤰 Gestaciones activas")
+        if df.empty:
+            st.info("No hay gestaciones activas.")
+            return
+
+        c1, c2 = st.columns(2)
+        c1.metric("Vacas gestantes", len(df), border=True)
+        proximo = df.iloc[0]
+        c2.metric("Próximo parto", f"{proximo['nombre_vaca']} · {int(proximo['dias_faltantes'])} días", border=True)
+
+        st.dataframe(
+            df[['nombre_vaca', 'fecha_monta', 'fecha_parto_estimada', 'dias_faltantes']],
+            hide_index=True, width="stretch",
+            column_config={
+                'nombre_vaca': st.column_config.TextColumn("Vaca"),
+                'fecha_monta': st.column_config.DateColumn("Fecha de monta", format="DD/MM/YYYY"),
+                'fecha_parto_estimada': st.column_config.DateColumn("Parto estimado", format="DD/MM/YYYY"),
+                'dias_faltantes': st.column_config.NumberColumn("Días faltantes para parto", format="%d"),
+            },
+        )
+
+        # Solo el administrador envía el reporte; los socios solo lo reciben y consultan la tabla
+        if es_admin() and st.button("📧 Enviar reporte a socios", type="primary", width="stretch"):
+            try:
+                with st.spinner("Enviando correo..."):
+                    enviados = enviar_reporte_socios(df)
+            except KeyError as e:
+                st.error(f"No se pudo enviar: falta {e} en la sección [email] de los secrets.")
+            except smtplib.SMTPAuthenticationError:
+                st.error("Gmail rechazó el usuario o la contraseña. Usa una 'contraseña de aplicación' de Google, "
+                         "no la contraseña normal de la cuenta.")
+            except Exception as e:
+                st.error(f"No se pudo enviar el correo ({type(e).__name__}: {e}).")
+            else:
+                st.success(f"Reporte enviado a {enviados} socio(s).")
+
+
+# =====================================================================
 # ROLES Y MENÚ DE NAVEGACIÓN
 # =====================================================================
 
@@ -843,6 +993,7 @@ with st.sidebar:
             "📝 Registro Operativo": seccion_registro,
             "💰 Facturación y Análisis": seccion_facturacion,
             "📈 Control Financiero": seccion_financiera,
+            "🐮 Manejo Reproductivo": seccion_reproductivo,
             "⚙️ Configuración y Respaldo": seccion_configuracion,
         }
     elif rol_actual() == ROL_TRABAJADOR:
@@ -853,6 +1004,7 @@ with st.sidebar:
         SECCIONES = {
             "💰 Facturación y Análisis": seccion_facturacion,
             "📈 Control Financiero": seccion_financiera,
+            "🐮 Manejo Reproductivo": seccion_reproductivo,
         }
     else:
         SECCIONES = {}
